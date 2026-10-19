@@ -5,9 +5,10 @@ Only the task constants come from jansen_opt_torch; the kinematics here are writ
 arccos circle intersections with NO clamp (NaN = the leg cannot assemble there), transmission angles
 measured from the joint positions, link lengths re-measured."""
 import sys, numpy as np
-from jansen_opt_torch import T, SIGMA, N_ST, NAMES, MU_REQ, D2R
+from jansen_opt_torch import T, SIGMA, N_ST, NAMES, MU_REQ, D2R, MOTION
 
 T_C = T.numpy() @ [1, 1j]
+T_AREA = 0.5 * np.sum(T_C.real * np.roll(T_C.imag, -1) - np.roll(T_C.real, -1) * T_C.imag)   # in visiting order
 JOINTS = "O M Z P1 P2 P3 P4 F".split()
 LINKS = [("O", "M", "m"), ("M", "P1", "j"), ("Z", "P1", "b"), ("Z", "P2", "d"), ("P1", "P2", "e"),
          ("M", "P3", "k"), ("Z", "P3", "c"), ("P2", "P4", "f"), ("P3", "P4", "g"), ("P3", "F", "i"),
@@ -30,9 +31,9 @@ def travel_np(v):
     return np.r_[ds * np.arange(N_ST), (N_ST - 1) * ds + np.cumsum(gaps[:-1])]
 
 def pose_np(v, dth, hand):
-    """All joints (complex, body frame) at crank travel dth; theta2 = theta0 + hand * dth."""
+    """All joints (complex, body frame) at crank travel dth; theta2 = theta0 + hand * MOTION * dth."""
     m, ax, ay, b, c, d, e, f, g, h, i, j, k = v[:13]
-    t2 = v[13] + hand * np.atleast_1d(np.asarray(dth, float))
+    t2 = v[13] + hand * MOTION * np.atleast_1d(np.asarray(dth, float))
     M = m * np.exp(1j * t2)
     Z = complex(-ax, -ay) + 0 * M
     P1 = dyad_np(M, Z, j, b, SIGMA[0])
@@ -82,8 +83,10 @@ def report(v, hand, step=0.1, verbose=True):
         print("toggle margin [mm]:", {k: round(x, 2) for k, x in out["toggle_margin"].items()})
         print(f"miss rms all / stance / worst [mm]: {out['rms_all']:.3f} / {out['rms_stance']:.3f} / {out['worst']:.3f}")
         print("miss per target [mm]:", np.round(miss, 2))
-        print(f"stance foot Y range [mm]: {out['stance_Y'][0]:.2f} .. {out['stance_Y'][1]:.2f} | lowest foot Y {out['lowest_Y']:.2f}")
-        print(f"foot loop signed area {out['area']:.0f} mm^2 (T: +958, same sign = same direction)")
+        print(f"stance foot Y range [mm]: {out['stance_Y'][0]:.2f} .. {out['stance_Y'][1]:.2f}")
+        print(f"lowest foot Y over the turn [mm]: {out['lowest_Y']:.3f} (must be >= 0: "
+              f"{'ok' if out['lowest_Y'] >= -0.01 else 'BELOW THE FLOOR'})")
+        print(f"foot loop signed area {out['area']:.0f} mm^2 (T: {T_AREA:+.0f}, same sign = same direction)")
     return out
 
 def load(path):

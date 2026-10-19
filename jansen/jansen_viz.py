@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Polygon, Circle
-from jansen_opt_torch import T, N_ST, NAMES, MU_REQ, DE_LO, DE_HI
+from jansen_opt_torch import T, N_ST, NAMES, MU_REQ, DE_LO, DE_HI, MOTION
 from verify_jansen import pose_np, travel_np, mu_np, DYADS, JOINTS
 
 plt.rcParams["animation.embed_limit"] = 60
@@ -77,7 +77,7 @@ def plot_task():
     targets(ax, labels=True)
     ax.plot(np.r_[T_C, T_C[:1]].real, np.r_[T_C, T_C[:1]].imag, ":", color=PINK, lw=1)
     ax.set_aspect("equal"); ax.legend(fontsize=8, loc="upper left")
-    ax.set_title("targets T (jansen_opt.py), traced counter-clockwise")
+    ax.set_title("targets T (jansen_opt.py), visited " + ("counter-clockwise" if MOTION > 0 else "clockwise"))
     return fig
 
 def plot_best(v, hand, title=None):
@@ -94,7 +94,8 @@ def plot_best(v, hand, title=None):
     fit_view(ax, list(turn.values()) + [T_C])
     miss = abs(Ck - T_C)
     mu = min(np.nanmin(m) for m in dyad_mus(turn))
-    ax.set_title(title or "rms miss %.2f mm | worst %.2f mm | mu_min %.1f deg" % (np.sqrt(np.mean(miss ** 2)), miss.max(), mu))
+    ax.set_title(title or "rms miss %.2f mm | worst %.2f mm | mu_min %.1f deg | lowest Y %.2f mm"
+                 % (np.sqrt(np.mean(miss ** 2)), miss.max(), mu, np.nanmin(turn["F"].imag)), fontsize=10)
     ax.legend(loc="upper left", fontsize=7)
     k = np.arange(len(T_C))
     bx.bar(k[:N_ST], miss[:N_ST], color=PINK, label="stance (timed)")

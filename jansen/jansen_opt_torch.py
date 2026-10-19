@@ -15,12 +15,13 @@ Design vector v (27), mm and rad:
   m ax ay b c d e f g h i j k   Jansen's letters: crank m, frame pivot Z = (-ax, -ay), 10 rods
   theta0 hX hY                   crank angle at target 0, crank axle O in the body frame
   dth_s q1..q10                  timing: stance crank step, swing-gap softmax logits
-Body frame = the frame of the targets T (jansen_opt.py): floor at Y = 0.
+Body frame = the frame of the targets T (jansen_opt.py): floor at Y = 0. Rules: transmission angle
+>= 40 deg at every dyad, and the foot never below the floor, both over the whole crank turn.
 """
 import math, time, argparse
 import numpy as np
 import torch
-from torch.func import vmap, jacrev, hessian
+from torch.func import vmap, jacrev, jacfwd, hessian
 from scipy.optimize import differential_evolution, least_squares
 from scipy.stats import qmc, spearmanr
 
@@ -29,11 +30,14 @@ D2R = math.pi / 180
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ------------------------------------------------------------------ task (hybrid timing)
-T = torch.tensor([                              # the group's foot loop, copied from jansen_opt.py
-    (0, 0), (10, 0), (20, 0), (30, 0),          # stance: on the floor, timed
+T_LOOP = torch.tensor([                         # the group's foot loop, copied from jansen_opt.py
+    (0, 0), (10, 0), (20, 0), (30, 0),          # floor points
     (40, 2), (45, 5), (50, 10), (55, 20), (55, 30),
-    (44, 33.5), (30, 25), (23.5, 17), (15, 10), (5, 5),   # swing: untimed, in this order
+    (44, 33.5), (30, 25), (23.5, 17), (15, 10), (5, 5),   # as listed: counter-clockwise
 ], dtype=torch.float64)
+MOTION = -1                                      # -1: the foot goes round clockwise, stance sweeps X 30 -> 0;
+                                                 # +1: as listed, counter-clockwise, stance sweeps X 0 -> 30
+T = T_LOOP if MOTION > 0 else T_LOOP[[3, 2, 1, 0] + list(range(13, 3, -1))]   # targets in the order visited
 N_ST = 4                                         # targets 0..3 at crank travel k * dth_s (constant ground speed)
 N_GAP = len(T) - N_ST + 1                        # 11 gaps share the rest of the turn (softmax, first logit = 0)
 MU_REQ = 40 * D2R
@@ -43,6 +47,8 @@ TAU_MU, TAU_MM = 0.25 * D2R, 0.25                # soft-min / soft-max temperatu
                                                  # Hessian exists; conservative by at most tau*ln(180) ~ 1.3 deg
 EPS = 1e-12
 W_REJ, MARGIN = 10.0, 1.0                        # per mm of violation; keep 1 mm inside the rule
+W_GROUND, G_MARGIN = 30.0, 0.05                  # foot below Y = G_MARGIN, per mm (RMS over the turn): a squared
+                                                 # penalty always lets a little through, so aim 0.05 mm up
 
 # ------------------------------------------------------------------ mechanism
 HOLY = dict(m=15.0, ax=38.0, ay=7.8, b=41.5, c=39.3, d=40.1, e=55.8,     # Jansen's "holy numbers"
@@ -50,13 +56,13 @@ HOLY = dict(m=15.0, ax=38.0, ay=7.8, b=41.5, c=39.3, d=40.1, e=55.8,     # Janse
 SIGMA = (-1, +1, +1, -1, +1)     # branches of P1, P2, P3, P4, F: the only signs giving the classic leg
                                  # (P1 above Z, P2 left of Z, P3 below Z, P4 left of P3, foot lowest)
 HAND = +1                        # +1: frame pivot Z left of the crank (Jansen's drawing); -1: mirrored
-DIR = +1                         # crank direction, theta2 = theta0 + DIR * dth
+DIR = HAND * MOTION              # crank direction, theta2 = theta0 + DIR * dth
 
 def set_hand(hand):
-    """The holy leg traces its foot loop CCW for a CCW crank (signed area +876 mm^2), and so does T
-    (+958 mm^2). Mirroring flips the loop, so the crank must turn the other way: DIR = HAND."""
+    """The holy leg traces its foot loop CCW for a CCW crank (signed area +876 mm^2); T_LOOP is listed
+    CCW (+958 mm^2) and visited in the MOTION sense. Mirroring flips the loop, so DIR = HAND * MOTION."""
     global HAND, DIR
-    HAND, DIR = int(hand), int(hand)
+    HAND, DIR = int(hand), int(hand) * MOTION
 
 # ------------------------------------------------------------------ bounds -> unconstrained z
 NAMES = "m ax ay b c d e f g h i j k theta0 hX hY dth_s".split() + [f"q{n}" for n in range(1, N_GAP)]
@@ -138,10 +144,11 @@ def mu_acute(lp, lq, s2):
 
 # ------------------------------------------------------------------ residuals (SF 4.3) + sloped reject
 RES_NAMES = ([f"miss{n}{xy}" for n in range(len(T)) for xy in "XY"]
-             + ["mu_P1", "mu_P3", "mu_P4", "asm_P1", "asm_P3", "asm_P4", "tri_bde", "tri_ghi"])
+             + ["mu_P1", "mu_P3", "mu_P4", "asm_P1", "asm_P3", "asm_P4", "tri_bde", "tri_ghi"]
+             + [f"ground{int(round(float(t) / D2R))}" for t in t_turn])
 
 def residuals_v(v):
-    """r (36,) at the physical design v (27,). Works in any dtype/device (constants follow v)."""
+    """r (216,) at the physical design v (27,). Works in any dtype/device (constants follow v)."""
     m, ax, ay, b, c, d, e, f, g, h, i, j, k = v[:13]
     n = len(T)
     t2 = torch.cat([v[13] + DIR * travel(v), t_turn.to(v)])
@@ -160,7 +167,11 @@ def residuals_v(v):
     for sides in (torch.stack([b, d, e]), torch.stack([g, h, i])):                 # rigid triangles
         l = sides.max()
         tris.append(W_REJ * torch.relu(l - (sides.sum() - l) + MARGIN))
-    return torch.cat([miss.reshape(-1), torch.stack(mus + asms + tris)])
+    # foot must stay above the floor all the way round (C13: dropping clearance put the foot 27 mm
+    # through the floor between checks). One hinge per crank sample, like the four-bar's clearance
+    # residuals: sum of squares = W^2 * mean squared depth, and piecewise linear, which suits Gauss-Newton
+    ground = W_GROUND * torch.relu(G_MARGIN - (v[15] + F[n:, 1])) / math.sqrt(len(t_turn))   # 180
+    return torch.cat([miss.reshape(-1), torch.stack(mus + asms + tris), ground])
 
 def residuals(z):
     return residuals_v(unpack(z))
@@ -170,7 +181,8 @@ def J_v(v):
     return (r * r).sum()
 
 r_batch = vmap(residuals)
-A_batch = vmap(jacrev(residuals))                # exact 36x27 Jacobian per start
+A_batch = vmap(jacfwd(residuals))                # exact 216x27 Jacobian per start (forward mode:
+                                                 # 27 inputs, 216 outputs)
 J_v_batch = vmap(J_v)
 
 def score(V, device=DEVICE, dtype=torch.float64, chunk=4096):
@@ -185,7 +197,7 @@ def lm(z, r_fn=None, iters=300, lam=1e-2, tol=1e-10, trace=None):
     """leg_opt_torch.lm made general: any residual function r_fn(z) (default: residuals), and an
     optional list `trace` that collects (z, J) after every step for the C13-style animation."""
     rb = r_batch if r_fn is None else vmap(r_fn)
-    Ab = A_batch if r_fn is None else vmap(jacrev(r_fn))
+    Ab = A_batch if r_fn is None else vmap(jacfwd(r_fn))
     N, n = z.shape
     lam = torch.full((N,), lam, device=z.device)
     r = rb(z); J = (r * r).sum(1)
@@ -292,7 +304,7 @@ def refine(v, max_nfev=1500):
     physical v with the exact torch Jacobian and the true bounds. Needed because the sigmoid of z
     flattens next to a bound, and batched LM crawls when the best leg sits on one (it often does)."""
     fun = lambda x: residuals_v(torch.as_tensor(x)).numpy()
-    jac = lambda x: jacrev(residuals_v)(torch.as_tensor(x)).numpy()
+    jac = lambda x: jacfwd(residuals_v)(torch.as_tensor(x)).numpy()
     x0 = np.clip(v, RF_LO + 1e-9 * (DE_HI - DE_LO), RF_HI - 1e-9 * (DE_HI - DE_LO))
     s = least_squares(fun, x0, jac=jac, bounds=(RF_LO, RF_HI), x_scale="jac", max_nfev=max_nfev,
                       ftol=1e-12, xtol=1e-12, gtol=1e-9)
@@ -337,7 +349,8 @@ def polish(runs, K=64, n_refine=24, eps=0.03, device=DEVICE, iters=200, verbose=
     return basins
 
 def summary(v):
-    """RMS miss [mm] over the 14 targets and the smallest transmission angle [deg] (2-deg grid)."""
+    """RMS miss [mm] over the 14 targets, the smallest transmission angle [deg] and the lowest foot
+    Y [mm] over the turn (2-deg grid)."""
     vt = torch.as_tensor(v)
     r = residuals_v(vt)
     n = 2 * len(T)
@@ -346,14 +359,14 @@ def summary(v):
     M, Z, P1, P2, P3, P4, F = joints(vt, t_turn)
     mus = [mu_acute(lp, lq, ((Q - P) ** 2).sum(-1)).min() for P, Q, lp, lq in
            ((M, Z, j, b), (M, Z, k, c), (P2, P3, f, g))]
-    return rms, float(min(mus)) / D2R
+    return rms, float(min(mus)) / D2R, float((vt[15] + F[:, 1]).min())
 
 def basin_table(basins, n=12):
-    print(f"  {'#':>2} {'hand':>4} {'J*':>11} {'rms mm':>7} {'mu_min':>7} {'hits':>5}  seeds")
+    print(f"  {'#':>2} {'hand':>4} {'J*':>11} {'rms mm':>7} {'mu_min':>7} {'low Y':>7} {'hits':>5}  seeds")
     for q, B in enumerate(basins[:n]):
         set_hand(B["hand"])
-        rms, mu = summary(B["v"])
-        print(f"  {q:2d} {B['hand']:+4d} {B['J']:11.5f} {rms:7.3f} {mu:7.1f} {B['hits']:5d}  {sorted(B['seeds'])}")
+        rms, mu, low = summary(B["v"])
+        print(f"  {q:2d} {B['hand']:+4d} {B['J']:11.5f} {rms:7.3f} {mu:7.1f} {low:7.2f} {B['hits']:5d}  {sorted(B['seeds'])}")
 
 # ------------------------------------------------------------------ stage 3: Hessian (SF 4.4)
 SCALE = torch.as_tensor(DE_HI - DE_LO)            # one unit = the whole DE range of each number
@@ -373,7 +386,7 @@ def hessian_report(v, verbose=True):
     r = residuals_v(v); J = float((r * r).sum())
     g = jacrev(J_v)(v) * S
     H = hessian(J_v)(v) * S[:, None] * S[None, :]
-    A = jacrev(residuals_v)(v) * S
+    A = jacfwd(residuals_v)(v) * S
     GN = 2 * A.T @ A                                                  # Gauss-Newton part of H
     lo, hi = torch.as_tensor(RF_LO), torch.as_tensor(RF_HI)       # the bounds refine() works in
     width = torch.as_tensor(np.where(np.isfinite(RF_HI - RF_LO), RF_HI - RF_LO, np.inf))
@@ -402,6 +415,8 @@ def hessian_report(v, verbose=True):
         soft.append((float(ev[q]), [(NAMES[t], round(float(vecs[t, q]), 2)) for t in top]))
     pen = r[2 * len(T):]
     active = [RES_NAMES[2 * len(T) + n] for n in range(len(pen)) if pen[n] > 1e-9]
+    n_gr = sum(nm.startswith("ground") for nm in active)              # 180 hinges: report them as one
+    active = [nm for nm in active if not nm.startswith("ground")] + ([f"ground ({n_gr} samples)"] if n_gr else [])
     rep = dict(J=J, grad_norm=gnorm, converged=converged, evals=ev.numpy(), evecs=vecs.numpy(),
                cond=lam_max / max(float(ev.abs().min()), 1e-300), n_neg=n_neg, n_flat=n_flat, cls=cls,
                at_bound=[NAMES[n] for n in at_bound], kkt=kkt, active=active, soft=soft,
