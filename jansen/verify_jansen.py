@@ -5,7 +5,7 @@ Only the task constants come from jansen_opt_torch; the kinematics here are writ
 arccos circle intersections with NO clamp (NaN = the leg cannot assemble there), transmission angles
 measured from the joint positions, link lengths re-measured."""
 import sys, numpy as np
-from jansen_opt_torch import T, SIGMA, N_ST, NAMES, MU_REQ, D2R, MOTION
+from jansen_opt_torch import T, SIGMA, N_ST, NAMES, MU_REQ, D2R, MOTION, EQ_QMIN, TRI_MIN
 
 T_C = T.numpy() @ [1, 1j]
 T_AREA = 0.5 * np.sum(T_C.real * np.roll(T_C.imag, -1) - np.roll(T_C.real, -1) * T_C.imag)   # in visiting order
@@ -14,6 +14,16 @@ LINKS = [("O", "M", "m"), ("M", "P1", "j"), ("Z", "P1", "b"), ("Z", "P2", "d"), 
          ("M", "P3", "k"), ("Z", "P3", "c"), ("P2", "P4", "f"), ("P3", "P4", "g"), ("P3", "F", "i"),
          ("P4", "F", "h")]
 DYADS = [("P1", "M", "Z", "j", "b"), ("P3", "M", "Z", "k", "c"), ("P4", "P2", "P3", "f", "g")]
+TRIS = {"bde": ("Z", "P1", "P2"), "ghi": ("P3", "P4", "F")}     # the rigid plates, by their corners
+
+def triangle_np(pose, A, B, C):
+    """Shape of the plate A-B-C measured from the joints at the first pose: sides [mm], smallest
+    interior angle [deg] and quality q = 4 sqrt(3) Area / sum(side^2) (Area from the cross product)."""
+    a, b, c = pose[A][0], pose[B][0], pose[C][0]
+    sides = np.abs([b - a, c - b, a - c])
+    area = 0.5 * abs(((b - a).conjugate() * (c - a)).imag)
+    ang = [abs(np.angle((q - p) / (r - p))) for p, q, r in ((a, b, c), (b, c, a), (c, a, b))]
+    return sides, np.degrees(min(ang)), 4 * np.sqrt(3) * area / np.sum(sides ** 2)
 
 def dyad_np(P, Q, lp, lq, sigma):
     """Point X with |XP| = lp, |XQ| = lq (complex numbers); NaN where the circles do not meet."""
@@ -53,7 +63,11 @@ def mu_np(pose, X, P, Q):
 def lengths(v):
     return dict(zip(NAMES[:13], v[:13]))
 
-def report(v, hand, step=0.1, verbose=True):
+def report(v, hand, step=0.1, verbose=True, cfg=None):
+    """cfg: the task/cost numbers the leg was made with (saved by jansen_opt_torch.save); the rules are
+    checked against its mu_req, eq_qmin and tri_min, else against the defaults."""
+    cfg = cfg or {}
+    mu_req, eq_qmin, tri_min = cfg.get("mu_req", MU_REQ / D2R), cfg.get("eq_qmin", EQ_QMIN), cfg.get("tri_min", TRI_MIN)
     v = np.asarray(v, float)
     L = lengths(v)
     dth = np.radians(np.arange(0, 360, step))
@@ -76,10 +90,11 @@ def report(v, hand, step=0.1, verbose=True):
     F = P["F"]
     out["area"] = 0.5 * np.nansum(F.real * np.roll(F.imag, -1) - np.roll(F.real, -1) * F.imag)
     out["lowest_Y"] = np.nanmin(F.imag)
+    out["triangles"] = {nm: triangle_np(P, *XYZ) for nm, XYZ in TRIS.items()}
     if verbose:
         print(f"hand {hand:+d} | dth_s {np.degrees(v[16]):.1f} deg -> stance over {np.degrees(tk[N_ST - 1]):.1f} deg of crank")
         print("assembles over the whole turn:", out["assembles"], f"| link-length error {out['closure']:.1e} mm")
-        print("mu_min [deg]:", {k: round(x, 2) for k, x in out["mu_min"].items()}, f"(required {np.degrees(MU_REQ):.0f})")
+        print("mu_min [deg]:", {k: round(x, 2) for k, x in out["mu_min"].items()}, f"(required {mu_req:g})")
         print("toggle margin [mm]:", {k: round(x, 2) for k, x in out["toggle_margin"].items()})
         print(f"miss rms all / stance / worst [mm]: {out['rms_all']:.3f} / {out['rms_stance']:.3f} / {out['worst']:.3f}")
         print("miss per target [mm]:", np.round(miss, 2))
@@ -87,16 +102,22 @@ def report(v, hand, step=0.1, verbose=True):
         print(f"lowest foot Y over the turn [mm]: {out['lowest_Y']:.3f} (must be >= 0: "
               f"{'ok' if out['lowest_Y'] >= -0.01 else 'BELOW THE FLOOR'})")
         print(f"foot loop signed area {out['area']:.0f} mm^2 (T: {T_AREA:+.0f}, same sign = same direction)")
+        for nm, (sides, amin, q) in out["triangles"].items():
+            flags = ([f"side < {tri_min:g} mm"] if sides.min() < tri_min - 0.01 else []) + \
+                    ([f"q < {eq_qmin:g}"] if q < eq_qmin - 1e-3 else [])
+            print(f"triangle {nm}: sides {np.round(sides, 1)} mm | smallest angle {amin:.1f} deg | "
+                  f"quality q {q:.3f} (1 = equilateral) | {', '.join(flags) or 'ok'}")
     return out
 
 def load(path):
-    """(v, hand) from best_jansen.npz or best_jansen.pt."""
+    """(v, hand, cfg) from best_jansen.npz or best_jansen.pt; cfg is None for files saved before it was."""
     if path.endswith(".npz"):
+        import json
         d = np.load(path)
-        return d["v"], int(d["hand"])
+        return d["v"], int(d["hand"]), json.loads(str(d["cfg"])) if "cfg" in d else None
     import torch
     d = torch.load(path, weights_only=False)
-    return np.asarray(d["v"]), int(d["hand"])
+    return np.asarray(d["v"]), int(d["hand"]), d.get("cfg")
 
 if __name__ == "__main__":
     if "--holy" in sys.argv:
@@ -106,4 +127,5 @@ if __name__ == "__main__":
             print("Jansen's holy numbers, placed on T:")
             report(JO.holy_v().numpy(), hand)
     else:
-        report(*load(sys.argv[1] if len(sys.argv) > 1 else "best_jansen.npz"))
+        v, hand, cfg = load(sys.argv[1] if len(sys.argv) > 1 else "best_jansen.npz")
+        report(v, hand, cfg=cfg)

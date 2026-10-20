@@ -18,7 +18,7 @@ Design vector v (27), mm and rad:
 Body frame = the frame of the targets T (jansen_opt.py): floor at Y = 0. Rules: transmission angle
 >= 40 deg at every dyad, and the foot never below the floor, both over the whole crank turn.
 """
-import math, time, argparse
+import math, time, argparse, json
 import numpy as np
 import torch
 from torch.func import vmap, jacrev, jacfwd, hessian
@@ -49,6 +49,10 @@ EPS = 1e-12
 W_REJ, MARGIN = 10.0, 1.0                        # per mm of violation; keep 1 mm inside the rule
 W_GROUND, G_MARGIN = 30.0, 0.05                  # foot below Y = G_MARGIN, per mm (RMS over the turn): a squared
                                                  # penalty always lets a little through, so aim 0.05 mm up
+W_EQ, EQ_QMIN = 20.0, 0.75                       # rigid triangles: per unit of shape quality q below EQ_QMIN, where
+                                                 # q = 4 sqrt(3) Area / (a^2 + b^2 + c^2): 1 equilateral, 0.75 for
+                                                 # 30-60-90, -> 0 for a sliver (holy leg: b-d-e 0.89, g-h-i 0.76)
+W_LEN, TRI_MIN, LEN_MARGIN = 10.0, 20.0, 0.5     # triangle sides >= TRI_MIN mm, per mm short (aim LEN_MARGIN above)
 
 # ------------------------------------------------------------------ mechanism
 HOLY = dict(m=15.0, ax=38.0, ay=7.8, b=41.5, c=39.3, d=40.1, e=55.8,     # Jansen's "holy numbers"
@@ -142,13 +146,24 @@ def mu_acute(lp, lq, s2):
     root = torch.sqrt(torch.clamp(4 * lp * lp * lq * lq - mm * mm, min=EPS))
     return torch.atan2(root, mm.abs())
 
+def tri_quality(sides):
+    """Shape quality of a triangle, q = 4 sqrt(3) Area / (a^2 + b^2 + c^2): 1 for equilateral, -> 0 for a
+    sliver. Heron as 16 Area^2 = (a+b+c)(-a+b+c)(a-b+c)(a+b-c), clamped so the gradient stays finite
+    (a triangle that cannot close is policed by the tri_ residuals)."""
+    a, b, c = sides[..., 0], sides[..., 1], sides[..., 2]
+    a16 = (a + b + c) * (-a + b + c) * (a - b + c) * (a + b - c)
+    return math.sqrt(3) * torch.sqrt(torch.clamp(a16, min=EPS)) / (a * a + b * b + c * c)
+
 # ------------------------------------------------------------------ residuals (SF 4.3) + sloped reject
-RES_NAMES = ([f"miss{n}{xy}" for n in range(len(T)) for xy in "XY"]
-             + ["mu_P1", "mu_P3", "mu_P4", "asm_P1", "asm_P3", "asm_P4", "tri_bde", "tri_ghi"]
-             + [f"ground{int(round(float(t) / D2R))}" for t in t_turn])
+def res_names():
+    return ([f"miss{n}{xy}" for n in range(len(T)) for xy in "XY"]
+            + ["mu_P1", "mu_P3", "mu_P4", "asm_P1", "asm_P3", "asm_P4", "tri_bde", "tri_ghi"]
+            + [f"ground{int(round(float(t) / D2R))}" for t in t_turn]
+            + ["eq_bde", "eq_ghi"] + [f"len_{s}" for s in "bdeghi"])
+RES_NAMES = res_names()
 
 def residuals_v(v):
-    """r (216,) at the physical design v (27,). Works in any dtype/device (constants follow v)."""
+    """r (224,) at the physical design v (27,). Works in any dtype/device (constants follow v)."""
     m, ax, ay, b, c, d, e, f, g, h, i, j, k = v[:13]
     n = len(T)
     t2 = torch.cat([v[13] + DIR * travel(v), t_turn.to(v)])
@@ -163,15 +178,18 @@ def residuals_v(v):
         gap = torch.maximum(s - (lp + lq), torch.sqrt((lp - lq) ** 2 + EPS) - s)  # > 0: cannot close
         gap_max = TAU_MM * torch.logsumexp(gap / TAU_MM, 0)                        # soft max over the turn
         asms.append(W_REJ * torch.relu(gap_max + MARGIN))                          # slope off the plateau
-    tris = []
+    tris, eqs, lens = [], [], []
     for sides in (torch.stack([b, d, e]), torch.stack([g, h, i])):                 # rigid triangles
         l = sides.max()
         tris.append(W_REJ * torch.relu(l - (sides.sum() - l) + MARGIN))
+        # manufacturable plates: no slivers (shape quality q >= EQ_QMIN) and no side under TRI_MIN
+        eqs.append(W_EQ * torch.relu(EQ_QMIN - tri_quality(sides)))
+        lens.append(W_LEN * torch.relu(TRI_MIN + LEN_MARGIN - sides))
     # foot must stay above the floor all the way round (C13: dropping clearance put the foot 27 mm
     # through the floor between checks). One hinge per crank sample, like the four-bar's clearance
     # residuals: sum of squares = W^2 * mean squared depth, and piecewise linear, which suits Gauss-Newton
     ground = W_GROUND * torch.relu(G_MARGIN - (v[15] + F[n:, 1])) / math.sqrt(len(t_turn))   # 180
-    return torch.cat([miss.reshape(-1), torch.stack(mus + asms + tris), ground])
+    return torch.cat([miss.reshape(-1), torch.stack(mus + asms + tris), ground, torch.stack(eqs)] + lens)
 
 def residuals(z):
     return residuals_v(unpack(z))
@@ -181,8 +199,8 @@ def J_v(v):
     return (r * r).sum()
 
 r_batch = vmap(residuals)
-A_batch = vmap(jacfwd(residuals))                # exact 216x27 Jacobian per start (forward mode:
-                                                 # 27 inputs, 216 outputs)
+A_batch = vmap(jacfwd(residuals))                # exact 224x27 Jacobian per start (forward mode:
+                                                 # 27 inputs, 224 outputs)
 J_v_batch = vmap(J_v)
 
 def score(V, device=DEVICE, dtype=torch.float64, chunk=4096):
@@ -349,8 +367,9 @@ def polish(runs, K=64, n_refine=24, eps=0.03, device=DEVICE, iters=200, verbose=
     return basins
 
 def summary(v):
-    """RMS miss [mm] over the 14 targets, the smallest transmission angle [deg] and the lowest foot
-    Y [mm] over the turn (2-deg grid)."""
+    """RMS miss [mm] over the 14 targets, the smallest transmission angle [deg], the lowest foot
+    Y [mm] over the turn (2-deg grid), the worse rigid-triangle shape quality q and the shortest
+    triangle side [mm]."""
     vt = torch.as_tensor(v)
     r = residuals_v(vt)
     n = 2 * len(T)
@@ -359,17 +378,68 @@ def summary(v):
     M, Z, P1, P2, P3, P4, F = joints(vt, t_turn)
     mus = [mu_acute(lp, lq, ((Q - P) ** 2).sum(-1)).min() for P, Q, lp, lq in
            ((M, Z, j, b), (M, Z, k, c), (P2, P3, f, g))]
-    return rms, float(min(mus)) / D2R, float((vt[15] + F[:, 1]).min())
+    tri = torch.stack([torch.stack([b, d, e]), torch.stack([g, h, i])])
+    return (rms, float(min(mus)) / D2R, float((vt[15] + F[:, 1]).min()),
+            float(tri_quality(tri).min()), float(tri.min()))
 
 def basin_table(basins, n=12):
-    print(f"  {'#':>2} {'hand':>4} {'J*':>11} {'rms mm':>7} {'mu_min':>7} {'low Y':>7} {'hits':>5}  seeds")
+    print(f"  {'#':>2} {'hand':>4} {'J*':>11} {'rms mm':>7} {'mu_min':>7} {'low Y':>7} {'tri q':>6} "
+          f"{'side':>6} {'hits':>5}  seeds")
     for q, B in enumerate(basins[:n]):
         set_hand(B["hand"])
-        rms, mu, low = summary(B["v"])
-        print(f"  {q:2d} {B['hand']:+4d} {B['J']:11.5f} {rms:7.3f} {mu:7.1f} {low:7.2f} {B['hits']:5d}  {sorted(B['seeds'])}")
+        rms, mu, low, tq, side = summary(B["v"])
+        print(f"  {q:2d} {B['hand']:+4d} {B['J']:11.5f} {rms:7.3f} {mu:7.1f} {low:7.2f} {tq:6.3f} {side:6.1f} "
+              f"{B['hits']:5d}  {sorted(B['seeds'])}")
 
 # ------------------------------------------------------------------ stage 3: Hessian (SF 4.4)
 SCALE = torch.as_tensor(DE_HI - DE_LO)            # one unit = the whole DE range of each number
+
+# ------------------------------------------------------------------ task / cost numbers, settable (CLI)
+BOX_NAMES = NAMES[:13] + ["hX", "hY", "dth_s"]     # the numbers LO/HI bound, in their order
+
+def config():
+    """The task and cost numbers in force, angles in deg (the keys configure() takes)."""
+    s = lambda nm: 1 / D2R if nm == "dth_s" else 1
+    return dict(mu_req=MU_REQ / D2R, tau_mu=TAU_MU / D2R, tau_mm=TAU_MM, w_rej=W_REJ, margin=MARGIN,
+                w_ground=W_GROUND, g_margin=G_MARGIN, w_eq=W_EQ, eq_qmin=EQ_QMIN, w_len=W_LEN,
+                tri_min=TRI_MIN, len_margin=LEN_MARGIN, q_max=Q_MAX,
+                turn_step=round(float(t_turn[1] - t_turn[0]) / D2R, 9),
+                bounds={nm: (float(LO[n]) * s(nm), float(HI[n]) * s(nm)) for n, nm in enumerate(BOX_NAMES)})
+
+def configure(**kw):
+    """Set any of config()'s numbers (bounds: {name: (lo, hi)} for some of BOX_NAMES, dth_s in deg) and
+    rebuild what is derived from them at import: the DE / refine boxes, SCALE, t_turn and RES_NAMES.
+    Call before synthesize(), and before importing jansen_viz / verify_jansen (they copy names)."""
+    global MU_REQ, TAU_MU, TAU_MM, W_REJ, MARGIN, W_GROUND, G_MARGIN, W_EQ, EQ_QMIN, W_LEN, TRI_MIN, \
+        LEN_MARGIN, Q_MAX, LO, HI, DE_LO, DE_HI, RF_LO, RF_HI, SCALE, t_turn, RES_NAMES
+    cfg = config()
+    bad = set(kw) - set(cfg)
+    if bad:
+        raise TypeError(f"configure: unknown setting(s) {sorted(bad)}; known: {sorted(cfg)}")
+    for nm, (lo, hi) in (kw.pop("bounds", None) or {}).items():
+        if nm not in BOX_NAMES:
+            raise ValueError(f"bound for {nm!r}: only {BOX_NAMES} have bounds")
+        if not lo < hi:
+            raise ValueError(f"bound for {nm!r}: need lo < hi, got {lo}, {hi}")
+        cfg["bounds"][nm] = (float(lo), float(hi))
+    cfg.update(kw)
+    MU_REQ, TAU_MU, TAU_MM = cfg["mu_req"] * D2R, cfg["tau_mu"] * D2R, cfg["tau_mm"]
+    W_REJ, MARGIN, W_GROUND, G_MARGIN = cfg["w_rej"], cfg["margin"], cfg["w_ground"], cfg["g_margin"]
+    W_EQ, EQ_QMIN, W_LEN, TRI_MIN, LEN_MARGIN = (cfg["w_eq"], cfg["eq_qmin"], cfg["w_len"], cfg["tri_min"],
+                                                 cfg["len_margin"])
+    Q_MAX = cfg["q_max"]
+    s = lambda nm: D2R if nm == "dth_s" else 1
+    LO = torch.tensor([cfg["bounds"][nm][0] * s(nm) for nm in BOX_NAMES])
+    HI = torch.tensor([cfg["bounds"][nm][1] * s(nm) for nm in BOX_NAMES])
+    DE_LO = np.r_[LO[:13].numpy(), -math.pi, LO[13:].numpy(), [-Q_MAX] * (N_GAP - 1)]     # as at import
+    DE_HI = np.r_[HI[:13].numpy(), math.pi, HI[13:].numpy(), [Q_MAX] * (N_GAP - 1)]
+    RF_LO, RF_HI = DE_LO.copy(), DE_HI.copy()
+    RF_LO[13], RF_HI[13] = -np.inf, np.inf
+    RF_LO[17:], RF_HI[17:] = -2 * Q_MAX, 2 * Q_MAX
+    SCALE = torch.as_tensor(DE_HI - DE_LO)
+    t_turn = torch.arange(0, 360, cfg["turn_step"]) * D2R
+    RES_NAMES = res_names()
+    return config()
 
 def hessian_report(v, verbose=True):
     """
@@ -491,16 +561,19 @@ def synthesize(hands=(+1, -1), seeds=4, n_lhs=20000, popsize=15, maxiter=300, st
     best["trace_V"] = np.array([unpack(trace[q][0][0]).detach().numpy() for q in keep] + [best["v"]])
     best["trace_J"] = np.array([float(trace[q][1][0]) for q in keep] + [best["J"]])   # last = refined
     if verbose: print(f"done in {time.time() - t0:.0f} s")
-    return dict(runs=runs, basins=basins, best=best)
+    return dict(runs=runs, basins=basins, best=best, cfg=config())
 
 def save(res, path="best_jansen"):
-    """best_jansen.pt (torch, like best_leg.pt) and best_jansen.npz (numpy, for verify/viz)."""
+    """best_jansen.pt (torch, like best_leg.pt) and best_jansen.npz (numpy, for verify/viz), each with
+    the task/cost numbers that produced the leg (cfg; a JSON string in the npz)."""
     B = res["best"]
     rep = B.get("rep", {})
+    cfg = res.get("cfg", config())
     torch.save({"v": torch.as_tensor(B["v"]), "J": B["J"], "hand": B["hand"],
-                "evals": rep.get("evals"), "cls": rep.get("cls")}, path + ".pt")
+                "evals": rep.get("evals"), "cls": rep.get("cls"), "cfg": cfg}, path + ".pt")
     np.savez(path + ".npz", v=B["v"], J=B["J"], hand=B["hand"], trace_V=B["trace_V"],
-             trace_J=B["trace_J"], evals=rep.get("evals", np.zeros(0)), evecs=rep.get("evecs", np.zeros(0)))
+             trace_J=B["trace_J"], evals=rep.get("evals", np.zeros(0)), evecs=rep.get("evecs", np.zeros(0)),
+             cfg=json.dumps(cfg))
 
 # ------------------------------------------------------------------ GPU or CPU? measure it
 def _sync(device):
@@ -542,7 +615,8 @@ def bench(sizes=(1000, 10000, 100000), Ks=(16, 64, 256)):
 
 # ------------------------------------------------------------------ main
 if __name__ == "__main__":
-    pa = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    pa = argparse.ArgumentParser(description=__doc__.split("\n")[1],
+                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     pa.add_argument("--hands", default="+1,-1", help="frame-pivot side(s): +1 Jansen's, -1 mirrored")
     pa.add_argument("--seeds", type=int, default=4, help="independent LHS/DE runs per hand")
     pa.add_argument("--nlhs", type=int, default=20000)
@@ -559,7 +633,46 @@ if __name__ == "__main__":
     pa.add_argument("--bench", action="store_true", help="measure CPU/GPU throughput and exit")
     pa.add_argument("--out", default="best_jansen")
     pa.add_argument("--no-figs", action="store_true")
+    c = config()                                   # task / cost numbers; defaults = the constants above
+    co = pa.add_argument_group("task and cost numbers (angles in deg)")
+    co.add_argument("--mu-req", type=float, default=c["mu_req"], help="min transmission angle at every dyad")
+    co.add_argument("--tau-mu", type=float, default=c["tau_mu"], help="soft-min temperature of mu over the turn")
+    co.add_argument("--tau-mm", type=float, default=c["tau_mm"], help="soft-max temperature of the assembly gap [mm]")
+    co.add_argument("--w-rej", type=float, default=c["w_rej"], help="weight per mm: assembly gap, triangle closure")
+    co.add_argument("--margin", type=float, default=c["margin"], help="mm kept inside the assembly/closure rules")
+    co.add_argument("--w-ground", type=float, default=c["w_ground"], help="weight per mm of foot below the floor")
+    co.add_argument("--g-margin", type=float, default=c["g_margin"], help="mm the foot aims above the floor")
+    co.add_argument("--w-eq", type=float, default=c["w_eq"], help="weight per unit of triangle quality q below "
+                    "--eq-qmin (0 = off)")
+    co.add_argument("--eq-qmin", type=float, default=c["eq_qmin"], help="triangle shape quality allowed for free: "
+                    "1 equilateral, 0.75 30-60-90; 1 = always pull toward equilateral")
+    co.add_argument("--w-len", type=float, default=c["w_len"], help="weight per mm a triangle side is short (0 = off)")
+    co.add_argument("--tri-min", type=float, default=c["tri_min"], help="min triangle side length [mm]")
+    co.add_argument("--len-margin", type=float, default=c["len_margin"], help="mm the sides aim above --tri-min")
+    co.add_argument("--q-max", type=float, default=c["q_max"], help="DE box for the swing-gap logits")
+    co.add_argument("--turn-step", type=float, default=c["turn_step"], help="crank sampling of the full turn")
+    co.add_argument("--bound", action="append", default=[], metavar="NAME=LO,HI",
+                    help=f"box of one number, repeatable; NAME in {' '.join(BOX_NAMES)} (dth_s in deg)")
     a = pa.parse_args()
+    bounds = {}
+    for s in a.bound:
+        try:
+            nm, rng = s.split("=")
+            lo, hi = (float(x) for x in rng.split(","))
+        except ValueError:
+            pa.error(f"--bound {s!r}: expected NAME=LO,HI")
+        bounds[nm] = (lo, hi)
+    try:
+        cfg = configure(mu_req=a.mu_req, tau_mu=a.tau_mu, tau_mm=a.tau_mm, w_rej=a.w_rej, margin=a.margin,
+                        w_ground=a.w_ground, g_margin=a.g_margin, w_eq=a.w_eq, eq_qmin=a.eq_qmin, w_len=a.w_len,
+                        tri_min=a.tri_min, len_margin=a.len_margin, q_max=a.q_max, turn_step=a.turn_step,
+                        bounds=bounds)
+    except ValueError as err:
+        pa.error(str(err))
+    changed = {k: x for k, x in cfg.items() if x != c[k] and k != "bounds"}
+    changed.update({nm: x for nm, x in cfg["bounds"].items() if x != c["bounds"][nm]})
+    if changed:
+        print("settings changed from the defaults:", changed)
     if a.bench:
         bench(); raise SystemExit
     if a.smoke:
@@ -574,6 +687,8 @@ if __name__ == "__main__":
     torch.save(res, a.out + "_run.pt")
     if not a.no_figs:
         import matplotlib; matplotlib.use("Agg")
+        import jansen_opt_torch                    # the copy jansen_viz imports from (this file runs as
+        jansen_opt_torch.configure(**cfg)          # __main__): give it the same numbers first
         import jansen_viz as JV
         from matplotlib.animation import PillowWriter
         JV.plot_best(B["v"], B["hand"]).savefig(a.out + "_best.png", dpi=110)
