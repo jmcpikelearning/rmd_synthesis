@@ -5,7 +5,7 @@ Only the task constants come from jansen_opt_torch; the kinematics here are writ
 arccos circle intersections with NO clamp (NaN = the leg cannot assemble there), transmission angles
 measured from the joint positions, link lengths re-measured."""
 import sys, numpy as np
-from jansen_opt_torch import T, SIGMA, N_ST, NAMES, MU_REQ, D2R, MOTION
+from jansen_opt_torch import T, SIGMA, N_ST, NAMES, MU_REQ, D2R, MOTION, X_BACK, Y_PIVOT
 
 T_C = T.numpy() @ [1, 1j]
 T_AREA = 0.5 * np.sum(T_C.real * np.roll(T_C.imag, -1) - np.roll(T_C.real, -1) * T_C.imag)   # in visiting order
@@ -76,6 +76,9 @@ def report(v, hand, step=0.1, verbose=True):
     F = P["F"]
     out["area"] = 0.5 * np.nansum(F.real * np.roll(F.imag, -1) - np.roll(F.real, -1) * F.imag)
     out["lowest_Y"] = np.nanmin(F.imag)
+    O, Z = P["O"][0], P["Z"][0]                    # ground pivots, measured from the pose
+    out["O"], out["Z"] = O, Z
+    out["pivots_ok"] = O.real <= X_BACK + 1e-6 and min(O.imag, Z.imag) >= Y_PIVOT - 0.01
     if verbose:
         print(f"hand {hand:+d} | dth_s {np.degrees(v[16]):.1f} deg -> stance over {np.degrees(tk[N_ST - 1]):.1f} deg of crank")
         print("assembles over the whole turn:", out["assembles"], f"| link-length error {out['closure']:.1e} mm")
@@ -87,6 +90,8 @@ def report(v, hand, step=0.1, verbose=True):
         print(f"lowest foot Y over the turn [mm]: {out['lowest_Y']:.3f} (must be >= 0: "
               f"{'ok' if out['lowest_Y'] >= -0.01 else 'BELOW THE FLOOR'})")
         print(f"foot loop signed area {out['area']:.0f} mm^2 (T: {T_AREA:+.0f}, same sign = same direction)")
+        print(f"pivots [mm]: O = ({O.real:.1f}, {O.imag:.1f}), Z = ({Z.real:.1f}, {Z.imag:.1f}) | "
+              f"O.x <= {X_BACK:.1f}, O.y and Z.y >= {Y_PIVOT:.1f}: {'ok' if out['pivots_ok'] else 'VIOLATED'}")
     return out
 
 def load(path):

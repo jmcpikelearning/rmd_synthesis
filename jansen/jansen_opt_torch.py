@@ -16,9 +16,11 @@ Design vector v (27), mm and rad:
   theta0 hX hY                   crank angle at target 0, crank axle O in the body frame
   dth_s q1..q10                  timing: stance crank step, swing-gap softmax logits
 Body frame = the frame of the targets T (jansen_opt.py): floor at Y = 0. Rules: transmission angle
->= 40 deg at every dyad, and the foot never below the floor, both over the whole crank turn.
+>= 40 deg at every dyad, and the foot never below the floor, both over the whole crank turn; the
+crank axle O no further forward than the largest target X, and both ground pivots O and Z at least
+20 mm above the tallest target.
 """
-import math, time, argparse
+import math, os, time, argparse
 import numpy as np
 import torch
 from torch.func import vmap, jacrev, jacfwd, hessian
@@ -49,6 +51,10 @@ EPS = 1e-12
 W_REJ, MARGIN = 10.0, 1.0                        # per mm of violation; keep 1 mm inside the rule
 W_GROUND, G_MARGIN = 30.0, 0.05                  # foot below Y = G_MARGIN, per mm (RMS over the turn): a squared
                                                  # penalty always lets a little through, so aim 0.05 mm up
+X_BACK = float(T[:, 0].max())                    # crank axle O behind the path: O.x <= the largest target X (55)
+PIVOT_CLEAR = 20.0                               # both ground pivots O and Z this far above the tallest target:
+Y_PIVOT = float(T[:, 1].max()) + PIVOT_CLEAR     # Y >= 53.5. O is (hX, hY), so its two rules are box bounds;
+                                                 # Z.y = hY - ay is a residual (Z_up)
 
 # ------------------------------------------------------------------ mechanism
 HOLY = dict(m=15.0, ax=38.0, ay=7.8, b=41.5, c=39.3, d=40.1, e=55.8,     # Jansen's "holy numbers"
@@ -67,8 +73,8 @@ def set_hand(hand):
 # ------------------------------------------------------------------ bounds -> unconstrained z
 NAMES = "m ax ay b c d e f g h i j k theta0 hX hY dth_s".split() + [f"q{n}" for n in range(1, N_GAP)]
 #                  m   ax   ay    b..k (10)   hX   hY   dth_s       (theta0, q1..q10 are free)
-LO = torch.tensor([5., 10., -30.] + [10.] * 10 + [-60., 30., 10 * D2R])
-HI = torch.tensor([30., 80., 30.] + [120.] * 10 + [120., 200., 70 * D2R])
+LO = torch.tensor([5., 10., -30.] + [10.] * 10 + [-60., max(30., Y_PIVOT), 10 * D2R])
+HI = torch.tensor([30., 80., 30.] + [120.] * 10 + [min(120., X_BACK), 200., 70 * D2R])
 Q_MAX = 3.0                                       # DE box for the gap logits (LM may leave it)
 DE_LO = np.r_[LO[:13].numpy(), -math.pi, LO[13:].numpy(), [-Q_MAX] * (N_GAP - 1)]
 DE_HI = np.r_[HI[:13].numpy(), math.pi, HI[13:].numpy(), [Q_MAX] * (N_GAP - 1)]
@@ -144,11 +150,11 @@ def mu_acute(lp, lq, s2):
 
 # ------------------------------------------------------------------ residuals (SF 4.3) + sloped reject
 RES_NAMES = ([f"miss{n}{xy}" for n in range(len(T)) for xy in "XY"]
-             + ["mu_P1", "mu_P3", "mu_P4", "asm_P1", "asm_P3", "asm_P4", "tri_bde", "tri_ghi"]
+             + ["mu_P1", "mu_P3", "mu_P4", "asm_P1", "asm_P3", "asm_P4", "tri_bde", "tri_ghi", "Z_up"]
              + [f"ground{int(round(float(t) / D2R))}" for t in t_turn])
 
 def residuals_v(v):
-    """r (216,) at the physical design v (27,). Works in any dtype/device (constants follow v)."""
+    """r (217,) at the physical design v (27,). Works in any dtype/device (constants follow v)."""
     m, ax, ay, b, c, d, e, f, g, h, i, j, k = v[:13]
     n = len(T)
     t2 = torch.cat([v[13] + DIR * travel(v), t_turn.to(v)])
@@ -167,11 +173,12 @@ def residuals_v(v):
     for sides in (torch.stack([b, d, e]), torch.stack([g, h, i])):                 # rigid triangles
         l = sides.max()
         tris.append(W_REJ * torch.relu(l - (sides.sum() - l) + MARGIN))
+    z_up = W_REJ * torch.relu(Y_PIVOT + MARGIN - (v[15] - ay))                   # frame pivot Z high enough
     # foot must stay above the floor all the way round (C13: dropping clearance put the foot 27 mm
     # through the floor between checks). One hinge per crank sample, like the four-bar's clearance
     # residuals: sum of squares = W^2 * mean squared depth, and piecewise linear, which suits Gauss-Newton
     ground = W_GROUND * torch.relu(G_MARGIN - (v[15] + F[n:, 1])) / math.sqrt(len(t_turn))   # 180
-    return torch.cat([miss.reshape(-1), torch.stack(mus + asms + tris), ground])
+    return torch.cat([miss.reshape(-1), torch.stack(mus + asms + tris + [z_up]), ground])
 
 def residuals(z):
     return residuals_v(unpack(z))
@@ -181,8 +188,8 @@ def J_v(v):
     return (r * r).sum()
 
 r_batch = vmap(residuals)
-A_batch = vmap(jacfwd(residuals))                # exact 216x27 Jacobian per start (forward mode:
-                                                 # 27 inputs, 216 outputs)
+A_batch = vmap(jacfwd(residuals))                # exact 217x27 Jacobian per start (forward mode:
+                                                 # 27 inputs, 217 outputs)
 J_v_batch = vmap(J_v)
 
 def score(V, device=DEVICE, dtype=torch.float64, chunk=4096):
@@ -336,17 +343,24 @@ def polish(runs, K=64, n_refine=24, eps=0.03, device=DEVICE, iters=200, verbose=
         if verbose:
             print(f"  refine hand {hand:+d}: {len(best)} best LM results in {time.time() - t0:.1f} s, "
                   f"best J {Jz.min():.4f}")
-        for n in np.argsort(Jz):
-            for B in basins:
-                if (B["hand"] == hand and abs(B["J"] - Jz[n]) <= 1e-4 * (1 + B["J"])
-                        and box_dist(unit(B["v"]), unit(Vz[n])) < 0.05):
-                    B["hits"] += 1; B["seeds"].add(int(src[sel[n]])); B["starts"].append(V[sel[n]])
-                    break
-            else:
-                basins.append(dict(hand=hand, v=Vz[n], J=float(Jz[n]), hits=1,
-                                   seeds={int(src[sel[n]])}, starts=[V[sel[n]]]))
-    basins.sort(key=lambda B: B["J"])
-    return basins
+        basins += [dict(hand=hand, v=Vz[n], J=float(Jz[n]), hits=1,
+                        seeds={int(src[sel[n]])}, starts=[V[sel[n]]]) for n in range(len(Jz))]
+    return merge_basins(basins)
+
+def merge_basins(basins, eps=0.05, jtol=1e-4):
+    """Best J first: a result with the same hand, J within jtol and box_dist < eps of a kept basin
+    joins it (hits, seeds, starts pooled). Run after polish and again after the saddle escapes,
+    which can move a basin onto one already found. Returns basins sorted by J."""
+    out = []
+    for C in sorted(basins, key=lambda B: B["J"]):
+        for B in out:
+            if (B["hand"] == C["hand"] and abs(B["J"] - C["J"]) <= jtol * (1 + B["J"])
+                    and box_dist(unit(B["v"]), unit(C["v"])) < eps):
+                B["hits"] += C["hits"]; B["seeds"] |= C["seeds"]; B["starts"] += C["starts"]
+                break
+        else:
+            out.append(C)
+    return out
 
 def summary(v):
     """RMS miss [mm] over the 14 targets, the smallest transmission angle [deg] and the lowest foot
@@ -479,7 +493,7 @@ def synthesize(hands=(+1, -1), seeds=4, n_lhs=20000, popsize=15, maxiter=300, st
                 B["v"], B["J"] = v2, J2
                 rep = hessian_report(v2, verbose)
         B["rep"] = rep
-    basins.sort(key=lambda B: B["J"])
+    basins = merge_basins(basins)
     if verbose:
         print("global evidence:")
         global_evidence(basins, runs)
@@ -501,6 +515,49 @@ def save(res, path="best_jansen"):
                 "evals": rep.get("evals"), "cls": rep.get("cls")}, path + ".pt")
     np.savez(path + ".npz", v=B["v"], J=B["J"], hand=B["hand"], trace_V=B["trace_V"],
              trace_J=B["trace_J"], evals=rep.get("evals", np.zeros(0)), evecs=rep.get("evecs", np.zeros(0)))
+
+def top_designs(basins, n=8, eps=0.05):
+    """The n best distinct designs: best J first, keep a basin only if it is more than eps (box_dist)
+    from every one kept. Points along one flat valley come out of LM/refine as separate 'basins';
+    eps = 0 keeps them all (the raw top n)."""
+    keep = []
+    for B in basins:
+        if all(box_dist(unit(K["v"]), unit(B["v"])) > eps for K in keep):
+            keep.append(B)
+            if len(keep) == n:
+                break
+    return keep
+
+def basin_ranks(basins, top):
+    """Index of each kept design in the full basin list (by identity: the dicts hold arrays)."""
+    return [next(q for q, B in enumerate(basins) if B is K) for K in top]
+
+# rod letter -> the two joints it connects (joints() above; O = crank axle, Z = frame pivot)
+ROD_JOINTS = dict(m="O-M", j="M-P1", b="Z-P1", d="Z-P2", e="P1-P2", k="M-P3", c="Z-P3",
+                  f="P2-P4", g="P3-P4", h="P4-F", i="P3-F")
+PARAM_INFO = {**ROD_JOINTS, "ax": "Z = (-ax, -ay) from O", "ay": "Z = (-ax, -ay) from O",
+              "theta0": "crank angle at target 0", "hX": "O in body frame", "hY": "O in body frame",
+              "dth_s": "crank step per stance target", **{f"q{n}": "swing gap logit" for n in range(1, N_GAP)}}
+
+def save_top(res, out_dir, n=8, eps=0.05):
+    """The n best distinct designs (top_designs): top_basins.npz (stacked, rank order, with what each
+    number means) and top/basin_XX.{pt,npz}, each in the best_jansen format so verify_jansen.py loads it."""
+    top = top_designs(res["basins"], n, eps)
+    d = os.path.join(out_dir, "top")
+    os.makedirs(d, exist_ok=True)
+    for q, B in enumerate(top):
+        rep = B.get("rep", {})
+        p = os.path.join(d, f"basin_{q:02d}")
+        torch.save({"v": torch.as_tensor(B["v"]), "J": B["J"], "hand": B["hand"], "hits": B["hits"],
+                    "evals": rep.get("evals"), "cls": rep.get("cls")}, p + ".pt")
+        np.savez(p + ".npz", v=B["v"], J=B["J"], hand=B["hand"], hits=B["hits"],
+                 evals=rep.get("evals", np.zeros(0)), evecs=rep.get("evecs", np.zeros(0)))
+    np.savez(os.path.join(out_dir, "top_basins.npz"), names=np.array(NAMES),
+             meaning=np.array([PARAM_INFO[nm] for nm in NAMES]),
+             rank=np.array(basin_ranks(res["basins"], top)),
+             V=np.stack([np.asarray(B["v"]) for B in top]), J=np.array([B["J"] for B in top]),
+             hand=np.array([B["hand"] for B in top]), hits=np.array([B["hits"] for B in top]))
+    return top
 
 # ------------------------------------------------------------------ GPU or CPU? measure it
 def _sync(device):
@@ -557,9 +614,14 @@ if __name__ == "__main__":
     pa.add_argument("--lm-device", default=DEVICE)
     pa.add_argument("--smoke", action="store_true", help="tiny settings, to check the pipeline")
     pa.add_argument("--bench", action="store_true", help="measure CPU/GPU throughput and exit")
-    pa.add_argument("--out", default="best_jansen")
+    pa.add_argument("--out", default=".", help="output directory (created if missing)")
+    pa.add_argument("--top", type=int, default=8, help="number of best distinct designs whose weights are saved")
+    pa.add_argument("--top-eps", type=float, default=0.05,
+                    help="min box_dist between saved designs (0 = raw top N, near-duplicates included)")
     pa.add_argument("--no-figs", action="store_true")
     a = pa.parse_args()
+    os.makedirs(a.out, exist_ok=True)
+    stem = os.path.join(a.out, "best_jansen")
     if a.bench:
         bench(); raise SystemExit
     if a.smoke:
@@ -570,19 +632,24 @@ if __name__ == "__main__":
     B = res["best"]
     for nm, x in zip(NAMES, B["v"]):
         print(f"  {nm:7s} {x / (D2R if nm in ('theta0', 'dth_s') else 1):9.3f}")
-    save(res, a.out)
-    torch.save(res, a.out + "_run.pt")
+    save(res, stem)
+    torch.save(res, stem + "_run.pt")
+    top = save_top(res, a.out, a.top, a.top_eps)
+    print(f"saved {stem}.{{pt,npz}}, {stem}_run.pt, and the top {len(top)} distinct designs "
+          f"(basins {basin_ranks(res['basins'], top)}) to",
+          os.path.join(a.out, "top_basins.npz"), "+", os.path.join(a.out, "top", "basin_XX.{pt,npz}"))
     if not a.no_figs:
         import matplotlib; matplotlib.use("Agg")
         import jansen_viz as JV
         from matplotlib.animation import PillowWriter
-        JV.plot_best(B["v"], B["hand"]).savefig(a.out + "_best.png", dpi=110)
-        JV.plot_basins(res["basins"]).savefig(a.out + "_basins.png", dpi=110)
-        JV.plot_de_convergence(res["runs"]).savefig(a.out + "_de.png", dpi=110)
+        JV.plot_best(B["v"], B["hand"]).savefig(stem + "_best.png", dpi=110)
+        JV.plot_basins(res["basins"]).savefig(stem + "_basins.png", dpi=110)
+        JV.plot_weights(top).savefig(os.path.join(a.out, "top_weights.png"), dpi=110)
+        JV.plot_de_convergence(res["runs"]).savefig(stem + "_de.png", dpi=110)
         if "rep" in B:
             set_hand(B["hand"])
             JV.plot_hessian_slice(B["v"], B["hand"], B["rep"], lambda V: score(V),
-                                  B["trace_V"]).savefig(a.out + "_hessian.png", dpi=110)
-        JV.animate_walk(B["v"], B["hand"]).save(a.out + "_walk.gif", writer=PillowWriter(fps=12))
-        JV.animate_lm(B["trace_V"], B["trace_J"], B["hand"]).save(a.out + "_lm.gif", writer=PillowWriter(fps=4))
-        print("figures:", a.out + "_{best,basins,de,hessian}.png,", a.out + "_{walk,lm}.gif")
+                                  B["trace_V"]).savefig(stem + "_hessian.png", dpi=110)
+        JV.animate_walk(B["v"], B["hand"]).save(stem + "_walk.gif", writer=PillowWriter(fps=12))
+        JV.animate_lm(B["trace_V"], B["trace_J"], B["hand"]).save(stem + "_lm.gif", writer=PillowWriter(fps=4))
+        print("figures:", stem + "_{best,basins,de,hessian}.png,", stem + "_{walk,lm}.gif")
